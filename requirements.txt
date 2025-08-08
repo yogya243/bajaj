@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+pydantic
+langchain
+langchain-core
+langchain-community
+langchain-openai
+faiss-cpu
+PyMuPDF
+docx2txt
+extract-msg
+msoffcrypto-tool
+olefile
+beautifulsoup4
+requests
