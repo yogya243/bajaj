@@ -2,7 +2,6 @@ import os
 import requests
 import asyncio
 import hashlib
-import gc
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
@@ -23,21 +22,24 @@ import re
 from pdf2image import convert_from_bytes
 import pytesseract
 
+# Load environment variables
 load_dotenv()
 
 app = FastAPI(
     title="AI Insurance Analyzer API",
-    description="Batch Q&A over insurance/legal/HR documents using LLMs",
+    description="Batch Q&A over insurance documents using LLMs",
     version="2.0.0"
 )
 
+# ----------- Input/Output Models -----------
 class AnalyzeRequest(BaseModel):
-    documents: str
-    questions: List[str]
+    documents: str  # URL to document
+    questions: List[str]  # No limit enforced
 
 class AnalyzeResponse(BaseModel):
     answers: List[str]
 
+# ----------- Cache Settings -----------
 INDEX_CACHE = {}
 CACHE_DIR = "faiss_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -45,32 +47,60 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 def get_doc_hash(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
+# ----------- Text Normalization -----------
 def normalize_text(text: str) -> str:
     text = re.sub(r'-\n', '', text)
     text = re.sub(r'\n+', '\n', text)
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
-def extract_text_from_pdf_streaming(file_bytes: bytes) -> str:
-    """Process PDF page-by-page to avoid memory bloat."""
+# ----------- File Extraction -----------
+def extract_text_from_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        all_pages = []
+        all_text = []
+        has_text = False
+
         for page_num, page in enumerate(doc, 1):
-            data = page.get_text("text")
-            if not data.strip():
-                img = page.get_pixmap()
-                ocr_text = pytesseract.image_to_string(img.tobytes(), lang="eng")
-                data = ocr_text
-            clean_text = normalize_text(data)
-            if clean_text:
-                all_pages.append(f"[Page {page_num}]\n{clean_text}")
-            del data, clean_text
-            gc.collect()
-        doc.close()
-        return "\n\n".join(all_pages)
+            data = page.get_text("dict")
+            page_content = []
+            table_mode = False
+
+            for block in data["blocks"]:
+                if "lines" not in block:
+                    continue
+                column_positions = {round(line["spans"][0]["bbox"][0], -1)
+                                    for line in block["lines"] if line["spans"]}
+                if len(column_positions) > 1 and not table_mode:
+                    page_content.append("[TABLE START]")
+                    table_mode = True
+
+                block_text = " ".join(span["text"].strip()
+                                      for line in block["lines"]
+                                      for span in line["spans"] if span["text"].strip())
+                if block_text:
+                    page_content.append(block_text)
+
+                if table_mode and len(column_positions) <= 1:
+                    page_content.append("[TABLE END]")
+                    table_mode = False
+
+            clean_page_text = normalize_text("\n".join(page_content))
+            if clean_page_text.strip():
+                has_text = True
+            all_text.append(f"[Page {page_num}]\n{clean_page_text}")
+
+        if not has_text:
+            images = convert_from_bytes(file_bytes)
+            ocr_texts = []
+            for i, img in enumerate(images, start=1):
+                ocr_text = pytesseract.image_to_string(img)
+                ocr_texts.append(f"[Page {i}]\n{normalize_text(ocr_text)}")
+            return "\n\n".join(ocr_texts)
+
+        return "\n\n".join(all_text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -78,72 +108,73 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
             f.write(file_bytes)
         return normalize_text(docx2txt.process("temp.docx"))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DOCX extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process DOCX: {e}")
 
 def extract_text_from_email(file_bytes: bytes) -> str:
     try:
         msg = BytesParser(policy=policy.default).parsebytes(file_bytes)
         return normalize_text(msg.get_body(preferencelist=('plain', 'html')).get_content())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Email extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process Email: {e}")
 
 def detect_file_type_and_extract(url: str) -> str:
     try:
-        r = requests.get(url, stream=True)
-        r.raise_for_status()
-        file_bytes = r.content
-        content_type = r.headers.get("Content-Type", "")
+        response = requests.get(url, stream=True)
+        file_bytes = response.content
+        content_type = response.headers.get("Content-Type", "")
+
         if "pdf" in content_type:
-            return extract_text_from_pdf_streaming(file_bytes)
+            return extract_text_from_pdf(file_bytes)
         elif "wordprocessingml" in content_type:
             return extract_text_from_docx(file_bytes)
         elif "message" in content_type or content_type == "application/octet-stream":
             return extract_text_from_email(file_bytes)
         else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {content_type}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Document fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch document: {e}")
 
+# ----------- Prompt -----------
 INSURANCE_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
-    template=(
-        "You are an intelligent assistant for policy/legal/HR documents.\n"
-        "Based ONLY on the following excerpts:\n"
-        "{context}\n\n"
-        "Question: {question}\n\n"
-        "Give a concise, factual answer strictly from the text. "
-        "Do not assume or invent. Quote relevant clauses if needed."
-    )
+    template="""
+You are a smart insurance policy assistant.
+Based only on the following excerpts from the policy:
+{context}
+
+Question: "{question}"
+
+Provide a concise, direct answer strictly based on the clauses above.
+Avoid assumptions. Mention specific clauses if helpful.
+"""
 )
 
-def build_faiss_index(chunks: List[Document], use_large=True) -> FAISS:
-    model_name = "text-embedding-3-large" if use_large else "text-embedding-3-small"
+# ----------- FAISS Utilities -----------
+def build_faiss_from_chunks(chunks: List[Document]) -> FAISS:
     embeddings = AzureOpenAIEmbeddings(
         deployment=os.getenv("AZURE_EMBEDDING_DEPLOYMENT"),
-        model=model_name,
+        model="text-embedding-3-large",
         azure_endpoint=os.getenv("AZURE_API_BASE"),
         openai_api_version=os.getenv("AZURE_API_VERSION"),
         openai_api_key=os.getenv("AZURE_API_KEY")
     )
     return FAISS.from_documents(chunks, embeddings)
 
-def save_faiss(faiss_index: FAISS, path: str):
+def save_faiss_to_disk(faiss_index: FAISS, path: str):
     faiss_index.save_local(path)
-    del faiss_index
-    gc.collect()
 
-def load_faiss(path: str, use_large=True) -> FAISS:
-    model_name = "text-embedding-3-large" if use_large else "text-embedding-3-small"
+def load_faiss_from_disk(path: str) -> FAISS:
     embeddings = AzureOpenAIEmbeddings(
         deployment=os.getenv("AZURE_EMBEDDING_DEPLOYMENT"),
-        model=model_name,
+        model="text-embedding-3-large",
         azure_endpoint=os.getenv("AZURE_API_BASE"),
         openai_api_version=os.getenv("AZURE_API_VERSION"),
         openai_api_key=os.getenv("AZURE_API_KEY")
     )
     return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
 
-def create_chain(faiss_index: FAISS):
+# ----------- Chain Creation -----------
+def create_langchain_chain_with_prompt(faiss_index: FAISS):
     llm = AzureChatOpenAI(
         temperature=0,
         deployment_name=os.getenv("model"),
@@ -153,56 +184,61 @@ def create_chain(faiss_index: FAISS):
     )
     return RetrievalQA.from_chain_type(
         llm=llm,
-        retriever=faiss_index.as_retriever(search_kwargs={"k": 6}),
-        chain_type_kwargs={"prompt": INSURANCE_PROMPT},
-        return_source_documents=False
+        retriever=faiss_index.as_retriever(search_kwargs={"k": 8, "search_type": "mmr"}),
+        return_source_documents=False,
+        chain_type_kwargs={"prompt": INSURANCE_PROMPT}
     )
 
-def get_chain_with_cache(doc_text: str):
-    doc_hash = get_doc_hash(doc_text)
+def get_chain_with_cache(document_text: str):
+    doc_hash = get_doc_hash(document_text)
     if doc_hash in INDEX_CACHE:
         return INDEX_CACHE[doc_hash]
 
     cache_path = os.path.join(CACHE_DIR, doc_hash)
-    use_large = len(doc_text) < 500_000  # heuristic for memory
     if os.path.exists(cache_path):
-        chain = create_chain(load_faiss(cache_path, use_large))
+        faiss_index = load_faiss_from_disk(cache_path)
+        chain = create_langchain_chain_with_prompt(faiss_index)
         INDEX_CACHE[doc_hash] = chain
         return chain
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=150)
-    chunks = [Document(page_content=txt, metadata={"id": i}) 
-              for i, txt in enumerate(splitter.split_text(doc_text))]
-    faiss_index = build_faiss_index(chunks, use_large)
-    save_faiss(faiss_index, cache_path)
-    chain = create_chain(load_faiss(cache_path, use_large))
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2000,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", " "]
+    )
+    chunks = [Document(page_content=text, metadata={"chunk_id": i})
+              for i, text in enumerate(splitter.split_text(document_text), start=1)]
+
+    faiss_index = build_faiss_from_chunks(chunks)
+    save_faiss_to_disk(faiss_index, cache_path)
+    chain = create_langchain_chain_with_prompt(faiss_index)
     INDEX_CACHE[doc_hash] = chain
-    del chunks
-    gc.collect()
     return chain
 
-async def ask_question(q: str, chain) -> str:
-    try:
-        return (await asyncio.to_thread(chain.run, q)).strip()
-    except:
-        return "No answer found."
+# ----------- Async Parallel Processing -----------
+async def ask_question(q: str, chain, semaphore: asyncio.Semaphore) -> str:
+    async with semaphore:
+        try:
+            return await asyncio.to_thread(chain.run, q)
+        except Exception as e:
+            return f"Error: {e}"
 
-async def process_questions(questions: List[str], chain):
-    results = []
-    for q in questions:
-        results.append(await ask_question(q, chain))
-    return results
+async def process_questions_parallel(questions: List[str], chain, max_concurrency: int = 5):
+    semaphore = asyncio.Semaphore(max_concurrency)
+    tasks = [ask_question(q, chain, semaphore) for q in questions]
+    return await asyncio.gather(*tasks)
 
+# ----------- API Endpoints -----------
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest):
-    doc_text = detect_file_type_and_extract(req.documents)
-    chain = get_chain_with_cache(doc_text)
-    answers = await process_questions(req.questions, chain)
-    return AnalyzeResponse(answers=answers)
+    document_text = detect_file_type_and_extract(req.documents)
+    chain = get_chain_with_cache(document_text)
+    answers = await process_questions_parallel(req.questions, chain, max_concurrency=5)
+    return AnalyzeResponse(answers=[a.strip() for a in answers])
 
 @app.get("/")
 def root():
-    return {"message": "LLM Query–Retrieval API running"}
+    return {"message": "AI Insurance Document Analyzer is running"}
 
 @app.head("/ping")
 async def head_ping():
