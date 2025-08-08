@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 python-dotenv
 pydantic
@@ -15,3 +15,6 @@ msoffcrypto-tool
 olefile
 beautifulsoup4
 requests
+pdf2image
+pytesseract
+Pillow
