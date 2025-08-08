@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ai-insurance-analyzer
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: model
+        value: your_model_name_here
+      - key: AZURE_API_KEY
+        sync: false
+      - key: AZURE_API_BASE
+        value: https://your-resource-name.openai.azure.com/
+      - key: AZURE_API_VERSION
+        value: 2023-05-15
