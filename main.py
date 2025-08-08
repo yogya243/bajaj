@@ -30,7 +30,7 @@ app = FastAPI(
 # ----------- Input/Output Models -----------
 class AnalyzeRequest(BaseModel):
     documents: str  # URL to document
-    questions: List[str]
+    questions: List[str]  # No limit enforced
 
 class AnalyzeResponse(BaseModel):
     answers: List[str]
@@ -144,11 +144,9 @@ def create_langchain_chain_with_prompt(faiss_index: FAISS):
 def get_chain_with_cache(document_text: str):
     doc_hash = get_doc_hash(document_text)
 
-    # Memory cache
     if doc_hash in INDEX_CACHE:
         return INDEX_CACHE[doc_hash]
 
-    # Disk cache
     cache_path = os.path.join(CACHE_DIR, doc_hash)
     if os.path.exists(cache_path):
         faiss_index = load_faiss_from_disk(cache_path)
@@ -156,17 +154,14 @@ def get_chain_with_cache(document_text: str):
         INDEX_CACHE[doc_hash] = chain
         return chain
 
-    # Build new index
     chunks = [document_text[i:i + 2000] for i in range(0, len(document_text), 1800)]
     faiss_index = build_faiss_from_chunks(chunks)
-
-    # Save to disk & memory
     save_faiss_to_disk(faiss_index, cache_path)
     chain = create_langchain_chain_with_prompt(faiss_index)
     INDEX_CACHE[doc_hash] = chain
     return chain
 
-# ----------- QA Logic (Parallel) -----------
+# ----------- QA Logic (Parallel, Unlimited) -----------
 async def ask_question(query: str, chain) -> str:
     try:
         result = await asyncio.to_thread(chain.run, query)
@@ -174,16 +169,22 @@ async def ask_question(query: str, chain) -> str:
     except Exception as e:
         return f"Error answering question: {e}"
 
+async def process_in_batches(questions: List[str], chain, batch_size: int = 20):
+    """Process questions in smaller batches to avoid memory overload."""
+    results = []
+    for i in range(0, len(questions), batch_size):
+        batch = questions[i:i+batch_size]
+        batch_results = await asyncio.gather(*[ask_question(q, chain) for q in batch])
+        results.extend(batch_results)
+    return results
+
 # ----------- API Endpoints -----------
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest):
     document_text = detect_file_type_and_extract(req.documents)
     chain = get_chain_with_cache(document_text)
 
-    answers = await asyncio.gather(
-        *[ask_question(q, chain) for q in req.questions]
-    )
-
+    answers = await process_in_batches(req.questions, chain)
     return AnalyzeResponse(answers=answers)
 
 @app.get("/")
