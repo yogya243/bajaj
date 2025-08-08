@@ -343,7 +343,7 @@ INSTRUCTIONS:
 - If two nearby clauses together answer, quote both and join with a single space.
 - If no clause exists, answer exactly: "NOT FOUND".
 - Output only valid JSON: {{ "answer": "<one concise sentence or NOT FOUND>", "sources": {json.dumps(sources)} }}
-- 'answer' must be one concise sentence (no commentary). Preserve numeric formatting as in the context.
+- 'answer' must be one concise sentence. Preserve numeric formatting as in the context.
 """
         llm = AzureChatOpenAI(
             temperature=0,
