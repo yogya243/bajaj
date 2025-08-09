@@ -138,7 +138,21 @@ def detect_language(text: str) -> str:
 
 GENERIC_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
-    template="""Answer strictly from the CONTEXT. If not found, say 'Information not available in the provided document.'\n\nCONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nFINAL ANSWER:"""
+    template="""You are an expert document analyst.
+Answer strictly based on the CONTEXT below. Do not hallucinate. If info missing, say "Information not available in the provided document."
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+INSTRUCTIONS:
+- Quote exact policy/paragraph text if relevant, then give a short interpretation.
+- For time periods, amounts, or explicit conditions, give exact figures and clause references if present.
+- Keep answers concise and factual.
+
+FINAL ANSWER:"""
 )
 
 def smart_text_splitter(document_text: str) -> List[Document]:
