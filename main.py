@@ -298,10 +298,16 @@ async def process_in_batches(questions: List[str], chain, batch_size: int = 15):
 
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest):
+    logger.info(f"📄 Document URL: {req.documents}")
+    logger.info(f"📝 Received {len(req.questions)} questions:")
+    for idx, q in enumerate(req.questions, 1):
+        logger.info(f"   Q{idx}: {q}")
+    
     document_text = detect_file_type_and_extract(req.documents)
     chain = get_chain_with_cache(document_text)
     answers = await process_in_batches(req.questions, chain)
     return AnalyzeResponse(answers=answers)
+
 
 @app.get("/")
 def root():
