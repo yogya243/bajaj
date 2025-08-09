@@ -150,7 +150,7 @@ QUESTION:
 INSTRUCTIONS:
 - Quote exact policy/paragraph text if relevant, then give a short interpretation.
 - For time periods, amounts, or explicit conditions, give exact figures and clause references if present.
-- Keep answers concise and factual.
+- Keep answers concise and factual but if data is available, give the full data for example in the document if a date is mentioned with month and year, respond with the full date in the response.
 
 FINAL ANSWER:"""
 )
