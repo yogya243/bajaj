@@ -299,13 +299,33 @@ async def process_in_batches(questions: List[str], chain, batch_size: int = 15):
 
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest):
-    logger.info(f"📄 Document URL: {req.documents}")
+    # Split multiple URLs by comma and clean spaces
+    urls = [u.strip() for u in req.documents.split(",") if u.strip()]
+    logger.info(f"📄 Received {len(urls)} document URLs:")
+    for i, url in enumerate(urls, 1):
+        logger.info(f"   Doc {i}: {url}")
+
     logger.info(f"📝 Received {len(req.questions)} questions:")
     for idx, q in enumerate(req.questions, 1):
         logger.info(f"   Q{idx}: {q}")
+
+    # Extract text from all URLs and combine
+    all_texts = []
+    for url in urls:
+        text = detect_file_type_and_extract(url)
+        if text.strip():
+            all_texts.append(text)
+
+    if not all_texts:
+        raise HTTPException(status_code=400, detail="No extractable text found in provided URLs")
+
+    # Merge all document texts into one
+    combined_text = "\n\n".join(all_texts)
+
+    # Create chain using combined text
+    chain = get_chain_with_cache(combined_text)
    
-    document_text = detect_file_type_and_extract(req.documents)
-    chain = get_chain_with_cache(document_text)
+    # Process questions
     answers = await process_in_batches(req.questions, chain)
     return AnalyzeResponse(answers=answers)
 
