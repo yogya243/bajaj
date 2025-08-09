@@ -3,9 +3,9 @@ import requests
 import asyncio
 import hashlib
 import logging
-from typing import List, Dict, Any
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from typing import List, Dict, Any
 import fitz  # PyMuPDF
 import docx2txt
 from email import policy
@@ -23,73 +23,43 @@ import re
 from pdf2image import convert_from_bytes
 import pytesseract
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-# ---------- Load env ----------
 load_dotenv()
 
-# Required env variables (these exact names are used)
-# model
-# AZURE_EMBEDDING_DEPLOYMENT
-# AZURE_API_KEY
-# AZURE_API_BASE
-# AZURE_API_VERSION
-# OPENAI_API_TYPE_LOCAL
-# API_TOKEN
-
-AZURE_API_BASE = os.getenv("AZURE_API_BASE")  # e.g. https://<your-resource>.cognitiveservices.azure.com
+AZURE_API_BASE = os.getenv("AZURE_API_BASE")
 AZURE_API_KEY = os.getenv("AZURE_API_KEY")
-AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "3.0")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION")
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_EMBEDDING_DEPLOYMENT")
-LLM_DEPLOYMENT = os.getenv("model")  # used as deployment_name for chat
+LLM_DEPLOYMENT = os.getenv("model")
 API_TOKEN = os.getenv("API_TOKEN")
 
-if not AZURE_API_BASE or not AZURE_API_KEY:
-    logger.warning("AZURE_API_BASE or AZURE_API_KEY not set. Translator or embeddings may fail at runtime.")
-
-# ---------- FastAPI app ----------
 app = FastAPI(title="Multilingual Document QnA", version="1.0.0")
 
-# ---------- Pydantic models ----------
-class QAItem(BaseModel):
-    question: str
-    language: str
-    answer: str
-
 class AnalyzeRequest(BaseModel):
-    documents: str  # one or many URLs separated by commas
+    documents: str
     questions: List[str]
 
-class AnalyzeResponse(BaseModel):
-    domain: str
-    answers: List[QAItem]
-
-# ---------- Caching / dirs ----------
 INDEX_CACHE: Dict[str, Any] = {}
 CACHE_DIR = "faiss_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ---------- Utility helpers ----------
 def get_doc_hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 def normalize_text(text: str) -> str:
-    """Basic normalizations for extracted text."""
-    text = re.sub(r'-\n', '', text)       # fix hyphen line breaks
+    text = re.sub(r'-\n', '', text)
     text = re.sub(r'\r\n', '\n', text)
     text = re.sub(r'\n+', '\n', text)
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
-# ---------- File extraction ----------
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         all_text_pages = []
         has_text = False
-
         for page_num, page in enumerate(doc, start=1):
             text_dict = page.get_text("dict")
             page_blocks = []
@@ -109,9 +79,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
             if page_text:
                 has_text = True
             all_text_pages.append(f"[Page {page_num}]\n{page_text}")
-
         if not has_text:
-            # OCR fallback
             logger.info("No embedded text found in PDF; performing OCR fallback.")
             images = convert_from_bytes(file_bytes)
             ocr_pages = []
@@ -119,9 +87,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
                 ocr = pytesseract.image_to_string(img)
                 ocr_pages.append(f"[Page {i}]\n{normalize_text(ocr)}")
             return "\n\n".join(ocr_pages)
-
         return "\n\n".join(all_text_pages)
-
     except Exception as e:
         logger.exception("PDF extraction failed")
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
@@ -147,54 +113,26 @@ def extract_text_from_email(file_bytes: bytes) -> str:
         raise HTTPException(status_code=500, detail=f"Failed to process email: {e}")
 
 def detect_file_type_and_extract(url: str) -> str:
-    """Fetch URL and extract text based on content type. Logs the fetch."""
     try:
         logger.info(f"Fetching document from URL: {url}")
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         file_bytes = resp.content
         content_type = (resp.headers.get("Content-Type") or "").lower()
-
         if "pdf" in content_type or url.lower().endswith(".pdf"):
             return extract_text_from_pdf(file_bytes)
         if "wordprocessingml" in content_type or url.lower().endswith(".docx"):
             return extract_text_from_docx(file_bytes)
         if "message" in content_type:
             return extract_text_from_email(file_bytes)
-
-        # fallback to try PDF extraction (works for many binary docs)
         return extract_text_from_pdf(file_bytes)
-
     except Exception as e:
         logger.exception("Failed to fetch or extract document")
         raise HTTPException(status_code=500, detail=f"Failed to fetch document from URL: {e}")
 
-# ---------- Domain detection (lightweight) ----------
-DOMAIN_KEYWORDS = {
-    "health_insurance": ["policy", "hospital", "sum insured", "pre-existing", "cumulative bonus", "waiting period", "room rent", "co-pay", "AYUSH"],
-    "trade_policy": ["tariff", "import", "export", "duty", "customs", "100% duty", "trade"],
-    "legal": ["hereby", "witnesseth", "contract", "agreement", "jurisdiction", "arbitration"],
-    "hr": ["employee", "leave", "termination", "salary", "grievance"],
-    "compliance": ["compliance", "regulation", "gdpr", "data protection", "audit"],
-}
-
-def detect_document_domain(text: str) -> str:
-    snippet = text[:2000].lower()
-    scores = {}
-    for domain, kws in DOMAIN_KEYWORDS.items():
-        scores[domain] = sum(1 for kw in kws if kw.lower() in snippet)
-    best = max(scores.items(), key=lambda x: x[1])
-    return best[0] if best[1] > 0 else "unknown"
-
-# ---------- Azure Translator helpers ----------
 def azure_translate(texts: List[str], to_lang: str = "en") -> List[Dict[str, Any]]:
-    """
-    Use Azure Translator Text API to translate a list of texts.
-    Returns the raw JSON decoded (list of translations and detected language).
-    """
     if not AZURE_API_BASE or not AZURE_API_KEY:
         raise RuntimeError("AZURE_API_BASE or AZURE_API_KEY not set for Translator")
-
     endpoint = AZURE_API_BASE.rstrip("/") + "/translate"
     params = {"api-version": "3.0", "to": to_lang}
     headers = {
@@ -207,9 +145,6 @@ def azure_translate(texts: List[str], to_lang: str = "en") -> List[Dict[str, Any
     return resp.json()
 
 def translate_to_english(text: str) -> (str, str):
-    """
-    Translate text to English. Returns (translated_text, detected_language_code)
-    """
     try:
         resp = azure_translate([text], to_lang="en")
         detected = resp[0].get("detectedLanguage", {}).get("language", "en")
@@ -220,20 +155,15 @@ def translate_to_english(text: str) -> (str, str):
         return text, "en"
 
 def translate_from_english(text: str, target_lang: str) -> str:
-    """
-    Translate English text back to target_lang.
-    """
     if target_lang == "en":
         return text
     try:
         resp = azure_translate([text], to_lang=target_lang)
-        translated = resp[0]["translations"][0]["text"]
-        return translated
+        return resp[0]["translations"][0]["text"]
     except Exception as e:
-        logger.warning(f"Translation from English to {target_lang} failed: {e}")
+        logger.warning(f"Translation from English failed: {e}")
         return text
 
-# ---------- Prompt (generalized) ----------
 GENERIC_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
     template="""You are an expert document analyst.
@@ -253,7 +183,6 @@ INSTRUCTIONS:
 FINAL ANSWER:"""
 )
 
-# ---------- Text splitting ----------
 def smart_text_splitter(document_text: str) -> List[Document]:
     section_pattern = r'\n(?=\d+\.?\s+[A-Z][^.]*[:\n])'
     major_sections = re.split(section_pattern, document_text)
@@ -274,7 +203,6 @@ def smart_text_splitter(document_text: str) -> List[Document]:
                 chunk_id += 1
     return docs
 
-# ---------- FAISS build/load ----------
 def build_faiss_from_chunks(chunks: List[Document]) -> FAISS:
     embeddings = AzureOpenAIEmbeddings(
         deployment=EMBEDDING_DEPLOYMENT,
@@ -298,7 +226,6 @@ def load_faiss_from_disk(path: str) -> FAISS:
     )
     return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
 
-# ---------- Retriever / LLM chain ----------
 def create_retriever(faiss_index: FAISS):
     return faiss_index.as_retriever(search_type="mmr", search_kwargs={"k": 10, "lambda_mult": 0.7})
 
@@ -315,7 +242,6 @@ def create_chain_from_faiss(faiss_index: FAISS):
     return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=False,
                                        chain_type_kwargs={"prompt": GENERIC_PROMPT})
 
-# ---------- Chain caching ----------
 def get_chain_with_cache(document_text: str):
     doc_hash = get_doc_hash(document_text)
     if doc_hash in INDEX_CACHE:
@@ -327,7 +253,6 @@ def get_chain_with_cache(document_text: str):
         chain = create_chain_from_faiss(faiss_index)
         INDEX_CACHE[doc_hash] = chain
         return chain
-    # build new index
     chunks = smart_text_splitter(document_text)
     logger.info(f"Building FAISS from {len(chunks)} chunks")
     faiss_index = build_faiss_from_chunks(chunks)
@@ -336,89 +261,48 @@ def get_chain_with_cache(document_text: str):
     INDEX_CACHE[doc_hash] = chain
     return chain
 
-# ---------- Enhanced QA worker ----------
-async def ask_question_with_optional_translation(query: str, chain) -> Dict[str, str]:
-    """
-    Returns dict { question, language, answer } ; translates query to English if needed, runs chain.run, translates back.
-    """
-    # detect & translate to English
-    translated_q, detected_lang = translate_to_english(query)
-    use_query = translated_q if detected_lang != "en" else query
-
-    # run chain in threadpool
+async def ask_question_with_optional_translation(query: str, chain) -> str:
     try:
+        translated_q, detected_lang = translate_to_english(query)
+        use_query = translated_q if detected_lang != "en" else query
         res = await asyncio.to_thread(chain.run, use_query)
+        final_answer = res
+        if detected_lang != "en":
+            final_answer = translate_from_english(res, detected_lang)
+        return final_answer.strip()
     except Exception as e:
-        logger.exception("LLM chain run failed")
-        return {"question": query, "language": detected_lang, "answer": f"Error answering question: {e}"}
+        logger.error(f"Error answering question '{query}': {e}")
+        return "Information not available in the provided document."
 
-    # translate back if needed
-    final_answer = res
-    if detected_lang != "en":
-        final_answer = translate_from_english(res, detected_lang)
-
-    return {"question": query, "language": detected_lang, "answer": final_answer.strip()}
-
-async def process_in_batches(questions: List[str], chain, batch_size: int = 12):
+async def process_in_batches(questions: List[str], chain) -> List[str]:
     results = []
-    for i in range(0, len(questions), batch_size):
-        batch = questions[i:i + batch_size]
+    for i in range(0, len(questions), 12):
+        batch = questions[i:i + 12]
         tasks = [ask_question_with_optional_translation(q, chain) for q in batch]
         batch_results = await asyncio.gather(*tasks, return_exceptions=False)
-        for r in batch_results:
-            results.append(r)
-        if i + batch_size < len(questions):
-            await asyncio.sleep(0.4)  # gentle throttle between batches
+        results.extend(batch_results)
+        if i + 12 < len(questions):
+            await asyncio.sleep(0.4)
     return results
 
-# ---------- Endpoint ----------
-@app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
+@app.post("/api/v1/hackrx/run")
 async def analyze_from_url(req: AnalyzeRequest, request: Request):
-    # Basic incoming logging
     logger.info(f"Incoming request from {request.client.host if request.client else 'unknown'}")
     urls = [u.strip() for u in req.documents.split(",") if u.strip()]
-    logger.info(f"📄 Received {len(urls)} document URLs:")
+    logger.info(f"📄 Received {len(urls)} document URLs")
     for idx, u in enumerate(urls, start=1):
         logger.info(f"   Doc{idx}: {u}")
-
-    logger.info(f"📝 Received {len(req.questions)} questions:")
+    logger.info(f"📝 Received {len(req.questions)} questions")
     for idx, q in enumerate(req.questions, start=1):
         logger.info(f"   Q{idx}: {q}")
-
-    # Extract text for each URL
-    all_texts = []
-    for url in urls:
-        text = detect_file_type_and_extract(url)
-        if text and text.strip():
-            all_texts.append(text)
-
-    if not all_texts:
-        raise HTTPException(status_code=400, detail="No extractable text found in provided URLs")
-
+    all_texts = [detect_file_type_and_extract(url) for url in urls]
+    if not any(all_texts):
+        raise HTTPException(status_code=400, detail="No extractable text found")
     combined_text = "\n\n".join(all_texts)
-
-    # Detect domain
-    domain = detect_document_domain(combined_text)
-    logger.info(f"📂 Document Domain Detected: {domain}")
-
-    # Build/load chain
     chain = get_chain_with_cache(combined_text)
-
-    # Process questions
-    raw_results = await process_in_batches(req.questions, chain)
-
-    # Format and log answers
-    answers_out: List[Dict[str, str]] = []
-    for item in raw_results:
-        q = item.get("question")
-        lang = item.get("language", "en")
-        ans = item.get("answer", "")
-        logger.info(f"✅ Q: {q}")
-        logger.info(f"   Lang: {lang}")
-        logger.info(f"   Answer: {ans}")
-        answers_out.append({"question": q, "language": lang, "answer": ans})
-
-    return AnalyzeResponse(domain=domain, answers=answers_out)
+    answers_out = await process_in_batches(req.questions, chain)
+    logger.info(f"✅ Answers: {answers_out}")
+    return {"answers": answers_out}
 
 @app.get("/")
 def root():
