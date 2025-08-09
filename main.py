@@ -117,6 +117,7 @@ def extract_text_from_email(file_bytes: bytes) -> str:
 
 def detect_file_type_and_extract(url: str) -> str:
     try:
+        logger.info(f"Fetching document from URL: {url}")
         response = requests.get(url)
         response.raise_for_status()
         file_bytes = response.content
@@ -302,7 +303,7 @@ async def analyze_from_url(req: AnalyzeRequest):
     logger.info(f"📝 Received {len(req.questions)} questions:")
     for idx, q in enumerate(req.questions, 1):
         logger.info(f"   Q{idx}: {q}")
-    
+   
     document_text = detect_file_type_and_extract(req.documents)
     chain = get_chain_with_cache(document_text)
     answers = await process_in_batches(req.questions, chain)
