@@ -212,17 +212,42 @@ async def ask_question(query: str, chain) -> str:
 
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest, request: Request):
+    # --- Logging for Render ---
     urls = [u.strip() for u in req.documents.split(",") if u.strip()]
-    all_texts = [detect_file_type_and_extract(url) for url in urls]
+    logger.info(f"📄 Received {len(urls)} document URLs:")
+    for idx, url in enumerate(urls, start=1):
+        logger.info(f"   Doc {idx}: {url}")
+
+    logger.info(f"📝 Received {len(req.questions)} questions:")
+    for idx, q in enumerate(req.questions, start=1):
+        logger.info(f"   Q{idx}: {q}")
+
+    # --- Extract text from all docs ---
+    all_texts = []
+    for url in urls:
+        text = detect_file_type_and_extract(url)
+        if text.strip():
+            all_texts.append(text)
+
+    if not all_texts:
+        raise HTTPException(status_code=400, detail="No extractable text found in provided URLs")
+
     combined_text = "\n\n".join(all_texts)
+
+    # Detect doc language and translate if needed (no cache blow-up)
     doc_lang = detect_language(combined_text)
     if doc_lang != "en":
         combined_text = translate_text(combined_text, target_lang="en")
+
+    # Build/retrieve chain
     chain = get_chain_with_cache(combined_text)
+
+    # Process questions with per-query translation + answer
     answers = []
     for q in req.questions:
         ans = await ask_question(q, chain)
         answers.append(ans)
+
     return AnalyzeResponse(answers=answers)
 
 @app.get("/")
