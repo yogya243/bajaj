@@ -3,7 +3,6 @@ import requests
 import asyncio
 import hashlib
 import logging
-import re
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Dict, Any
@@ -19,7 +18,8 @@ from langchain_openai import AzureOpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response
+import re
 from pdf2image import convert_from_bytes
 import pytesseract
 
@@ -48,12 +48,12 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeResponse(BaseModel):
     answers: List[str]
 
-# ---------- Cache ----------
+# ---------- Caching / dirs ----------
 INDEX_CACHE: Dict[str, Any] = {}
 CACHE_DIR = "faiss_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ---------- Utility ----------
+# ---------- Utility helpers ----------
 def get_doc_hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
@@ -70,7 +70,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         all_text_pages = []
         has_text = False
-
         for page_num, page in enumerate(doc, start=1):
             text_dict = page.get_text("dict")
             page_blocks = []
@@ -90,16 +89,14 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
             if page_text:
                 has_text = True
             all_text_pages.append(f"[Page {page_num}]\n{page_text}")
-
         if not has_text:
-            logger.info("No embedded text in PDF; OCR fallback.")
+            logger.info("No embedded text found in PDF; performing OCR fallback.")
             images = convert_from_bytes(file_bytes)
             ocr_pages = []
             for i, img in enumerate(images, start=1):
                 ocr = pytesseract.image_to_string(img)
                 ocr_pages.append(f"[Page {i}]\n{normalize_text(ocr)}")
             return "\n\n".join(ocr_pages)
-
         return "\n\n".join(all_text_pages)
     except Exception as e:
         logger.exception("PDF extraction failed")
@@ -132,7 +129,6 @@ def detect_file_type_and_extract(url: str) -> str:
         resp.raise_for_status()
         file_bytes = resp.content
         content_type = (resp.headers.get("Content-Type") or "").lower()
-
         if "pdf" in content_type or url.lower().endswith(".pdf"):
             return extract_text_from_pdf(file_bytes)
         if "wordprocessingml" in content_type or url.lower().endswith(".docx"):
@@ -144,24 +140,27 @@ def detect_file_type_and_extract(url: str) -> str:
         logger.exception("Failed to fetch or extract document")
         raise HTTPException(status_code=500, detail=f"Failed to fetch document from URL: {e}")
 
-# ---------- Language detection ----------
-def detect_language(text: str) -> str:
-    if re.search(r'[\u0D00-\u0D7F]', text):
-        return "ml"
-    return "en"
-
-# ---------- LLM translation ----------
-async def llm_translate_async(text: str, target_lang: str) -> str:
-    llm = AzureChatOpenAI(
-        temperature=0,
-        deployment_name=LLM_DEPLOYMENT,
-        azure_endpoint=AZURE_API_BASE,
-        openai_api_version=AZURE_API_VERSION,
-        openai_api_key=AZURE_API_KEY,
-        max_tokens=500
-    )
-    prompt = f"Translate the following text to {target_lang} without adding anything else:\n\n{text}"
-    return await asyncio.to_thread(llm.predict, prompt)
+# ---------- OpenAI Translation ----------
+def openai_detect_and_translate(text: str, target_lang: str = None):
+    try:
+        llm = AzureChatOpenAI(
+            temperature=0,
+            deployment_name=LLM_DEPLOYMENT,
+            azure_endpoint=AZURE_API_BASE,
+            openai_api_version=AZURE_API_VERSION,
+            openai_api_key=AZURE_API_KEY,
+            max_tokens=500
+        )
+        if target_lang:
+            prompt = f"Translate the following text to {target_lang}:\n{text}"
+            return llm.predict(prompt).strip()
+        else:
+            # Language detection
+            prompt = f"Detect the language of the following text and respond only with the language name:\n{text}"
+            return llm.predict(prompt).strip()
+    except Exception as e:
+        logger.warning(f"Translation/Detection failed: {e}")
+        return text
 
 # ---------- Prompt ----------
 GENERIC_PROMPT = PromptTemplate(
@@ -185,17 +184,24 @@ FINAL ANSWER:"""
 
 # ---------- Text splitting ----------
 def smart_text_splitter(document_text: str) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", ". ", "; ", " "],
-        length_function=len
-    )
-    return [
-        Document(page_content=chunk.strip(), metadata={"chunk_id": idx})
-        for idx, chunk in enumerate(splitter.split_text(document_text))
-        if len(chunk.strip()) > 50
-    ]
+    section_pattern = r'\n(?=\d+\.?\s+[A-Z][^.]*[:\n])'
+    major_sections = re.split(section_pattern, document_text)
+    docs = []
+    chunk_id = 0
+    for s_idx, sec in enumerate(major_sections):
+        if not sec.strip():
+            continue
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1200,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", ". ", "; ", ", ", " "],
+            length_function=len
+        )
+        for chunk in splitter.split_text(sec):
+            if len(chunk.strip()) > 50:
+                docs.append(Document(page_content=chunk.strip(), metadata={"chunk_id": chunk_id, "section": s_idx}))
+                chunk_id += 1
+    return docs
 
 # ---------- FAISS ----------
 def build_faiss_from_chunks(chunks: List[Document]) -> FAISS:
@@ -208,6 +214,9 @@ def build_faiss_from_chunks(chunks: List[Document]) -> FAISS:
     )
     return FAISS.from_documents(chunks, embeddings)
 
+def save_faiss_to_disk(faiss_index: FAISS, path: str):
+    faiss_index.save_local(path)
+
 def load_faiss_from_disk(path: str) -> FAISS:
     embeddings = AzureOpenAIEmbeddings(
         deployment=EMBEDDING_DEPLOYMENT,
@@ -218,7 +227,22 @@ def load_faiss_from_disk(path: str) -> FAISS:
     )
     return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
 
-# ---------- Chain with cache ----------
+def create_retriever(faiss_index: FAISS):
+    return faiss_index.as_retriever(search_type="mmr", search_kwargs={"k": 10, "lambda_mult": 0.7})
+
+def create_chain_from_faiss(faiss_index: FAISS):
+    llm = AzureChatOpenAI(
+        temperature=0.1,
+        deployment_name=LLM_DEPLOYMENT,
+        azure_endpoint=AZURE_API_BASE,
+        openai_api_version=AZURE_API_VERSION,
+        openai_api_key=AZURE_API_KEY,
+        max_tokens=500
+    )
+    retriever = create_retriever(faiss_index)
+    return RetrievalQA.from_chain_type(llm=llm, retriever=retriever,
+                                       chain_type_kwargs={"prompt": GENERIC_PROMPT})
+
 def get_chain_with_cache(document_text: str):
     doc_hash = get_doc_hash(document_text)
     if doc_hash in INDEX_CACHE:
@@ -229,47 +253,45 @@ def get_chain_with_cache(document_text: str):
     else:
         chunks = smart_text_splitter(document_text)
         faiss_index = build_faiss_from_chunks(chunks)
-        faiss_index.save_local(cache_path)
-    chain = RetrievalQA.from_chain_type(
-        llm=AzureChatOpenAI(
-            temperature=0.1,
-            deployment_name=LLM_DEPLOYMENT,
-            azure_endpoint=AZURE_API_BASE,
-            openai_api_version=AZURE_API_VERSION,
-            openai_api_key=AZURE_API_KEY,
-            max_tokens=500
-        ),
-        retriever=faiss_index.as_retriever(search_type="mmr", search_kwargs={"k": 10}),
-        return_source_documents=False,
-        chain_type_kwargs={"prompt": GENERIC_PROMPT}
-    )
+        save_faiss_to_disk(faiss_index, cache_path)
+    chain = create_chain_from_faiss(faiss_index)
     INDEX_CACHE[doc_hash] = chain
     return chain
 
-# ---------- QnA ----------
-async def ask_question(query: str, chain) -> str:
-    lang = detect_language(query)
-    translated_q = await llm_translate_async(query, "English") if lang != "en" else query
+# ---------- QA worker ----------
+async def ask_question_with_translation(query: str, chain) -> str:
+    original_lang = openai_detect_and_translate(query)  # detect language
+    translated_q = query
+    if original_lang.lower() != "english":
+        translated_q = openai_detect_and_translate(query, "English")
     res = await asyncio.to_thread(chain.run, translated_q)
-    return await llm_translate_async(res, "Malayalam") if lang == "ml" else res
+    if original_lang.lower() != "english":
+        res = openai_detect_and_translate(res, original_lang)
+    return res.strip()
 
-async def process_questions(questions: List[str], chain):
-    return await asyncio.gather(*(ask_question(q, chain) for q in questions))
+async def process_in_batches(questions: List[str], chain, batch_size: int = 12):
+    results = []
+    for i in range(0, len(questions), batch_size):
+        batch = questions[i:i + batch_size]
+        tasks = [ask_question_with_translation(q, chain) for q in batch]
+        batch_results = await asyncio.gather(*tasks)
+        results.extend(batch_results)
+    return results
 
-# ---------- Endpoints ----------
+# ---------- Endpoint ----------
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest, request: Request):
     urls = [u.strip() for u in req.documents.split(",") if u.strip()]
     all_texts = [detect_file_type_and_extract(url) for url in urls]
     combined_text = "\n\n".join(all_texts)
     chain = get_chain_with_cache(combined_text)
-    answers_out = await process_questions(req.questions, chain)
-    return AnalyzeResponse(answers=answers_out)
-
-@app.get("/ping")
-def ping():
-    return JSONResponse(content={"status": "ok", "message": "Service is alive"})
+    raw_results = await process_in_batches(req.questions, chain)
+    return AnalyzeResponse(answers=raw_results)
 
 @app.get("/")
 def root():
     return {"message": "Multilingual Document QnA running"}
+
+@app.head("/ping")
+def ping():
+    return Response(status_code=200)
