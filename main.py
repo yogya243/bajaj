@@ -434,6 +434,13 @@ async def get_raw_content_if_api(url: str):
         logger.warning(f"Failed to fetch raw content from API: {e}")
         return None
 
+# [Full corrected code with proper indentation and fixed function call]
+
+# ---------------- (Your imports and setup remain unchanged) ----------------
+# [The import section is exactly as you posted]
+
+# ... [all helper functions above remain unchanged] ...
+
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest, request: Request):
     urls = [u.strip() for u in req.documents.split(",") if u.strip()]
@@ -493,12 +500,15 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
 
         # --- Flight number procedural flow ---
         if "flight number" in q_lower or ("flight" in q_lower and "number" in q_lower):
-    logger.info("[flight-flow] detected flight-number question; running procedural flow")
-    flight_val = _get_flight_number_via_api_sequence()
-    if flight_val:
-        answers.append(flight_val)
-        continue
-
+            logger.info("[flight-flow] detected flight-number question; running procedural flow")
+            flight_val = _get_flight_number_via_api_sequence(combined_text)  # FIXED: passing doc_text
+            if flight_val:
+                answers.append(flight_val)
+            else:
+                logger.info("[flight-flow] flight flow failed; falling back to LLM retrieval")
+                ans = await ask_question(q, chain)
+                answers.append(ans)
+            continue
 
         # existing general flow
         ans = await ask_question(q, chain)
@@ -514,6 +524,7 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
         logger.info("📤 Response JSON returned to user (could not serialize)")
 
     return AnalyzeResponse(answers=answers)
+
 
 
 @app.get("/")
