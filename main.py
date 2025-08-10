@@ -424,6 +424,8 @@ async def get_raw_content_if_api(url: str):
         logger.warning(f"Failed to fetch raw content from API: {e}")
         return None
 
+# (all your imports and setup above stay unchanged)
+
 @app.post("/api/v1/hackrx/run", response_model=AnalyzeResponse)
 async def analyze_from_url(req: AnalyzeRequest, request: Request):
     urls = [u.strip() for u in req.documents.split(",") if u.strip()]
@@ -438,13 +440,11 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
     all_texts = []
 
     for url in urls:
-        # Check if URL is API returning raw token/text (like Input 2)
         raw_text = await get_raw_content_if_api(url)
         if raw_text:
             all_texts.append(raw_text)
             continue
 
-        # Otherwise, normal doc extraction
         text = await asyncio.to_thread(detect_file_type_and_extract, url)
         if text.strip():
             all_texts.append(text)
@@ -454,12 +454,10 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
 
     combined_text = "\n\n".join(all_texts)
 
-    # Language detection and translation (kept unchanged)
     doc_lang = detect_language(combined_text)
     if doc_lang != "en":
         combined_text = translate_text(combined_text, target_lang="en")
 
-    # Build or get cached chain for document text
     chain = get_chain_with_cache(combined_text)
 
     answers = []
@@ -482,32 +480,29 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
                 continue
 
         # --- Flight number procedural flow ---
-if "flight number" in q_lower or ("flight" in q_lower and "number" in q_lower):
-    logger.info("[flight-flow] detected flight-number question; running procedural flow")
-    flight_val = _get_flight_number_via_api_sequence(combined_text)
-    if flight_val:
-        answers.append(flight_val)
-    else:
-        logger.info("[flight-flow] flight flow failed; falling back to LLM retrieval")
-        ans = await ask_question(q, chain)
-        answers.append(ans)
-    continue
-
+        if "flight number" in q_lower or ("flight" in q_lower and "number" in q_lower):
+            logger.info("[flight-flow] detected flight-number question; running procedural flow")
+            flight_val = _get_flight_number_via_api_sequence(combined_text)
+            if flight_val:
+                answers.append(flight_val)
+            else:
+                logger.info("[flight-flow] flight flow failed; falling back to LLM retrieval")
+                ans = await ask_question(q, chain)
+                answers.append(ans)
+            continue
 
         # existing general flow
         ans = await ask_question(q, chain)
         answers.append(ans)
 
-    # Prepare output JSON object
     out = {"answers": answers}
-
-    # Log the exact JSON returned
     try:
         logger.info(f"📤 Response JSON returned to user: {json.dumps(out, ensure_ascii=False)}")
     except Exception:
         logger.info("📤 Response JSON returned to user (could not serialize)")
 
     return AnalyzeResponse(answers=answers)
+
 
 
 @app.get("/")
