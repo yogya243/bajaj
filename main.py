@@ -482,7 +482,7 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
                 continue
 
         # --- Flight number procedural flow ---
-        if "flight number" in q_lower or ("flight" in q_lower and "number" in q_lower):
+if "flight number" in q_lower or ("flight" in q_lower and "number" in q_lower):
     logger.info("[flight-flow] detected flight-number question; running procedural flow")
     flight_val = _get_flight_number_via_api_sequence(combined_text)
     if flight_val:
@@ -492,6 +492,7 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
         ans = await ask_question(q, chain)
         answers.append(ans)
     continue
+
 
         # existing general flow
         ans = await ask_question(q, chain)
