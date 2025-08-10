@@ -464,15 +464,30 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
 
     answers = []
     for q in req.questions:
-        # --- NEW: if question requests flight number, perform deterministic API flow using document parsing ---
         q_lower = q.lower()
+
+        # --- NEW: Secret token retrieval procedural flow ---
+        if "token" in q_lower:
+            logger.info("[token-flow] detected token request; fetching directly from provided doc URLs")
+            token_value = None
+            for url in urls:
+                token_value = await get_raw_content_if_api(url)
+                if token_value:
+                    break
+            if token_value:
+                answers.append(token_value.strip())
+                continue
+            else:
+                answers.append("Information not available in the provided document.")
+                continue
+
+        # --- Flight number procedural flow ---
         if "flight number" in q_lower or ("flight" in q_lower and "number" in q_lower):
             logger.info("[flight-flow] detected flight-number question; running procedural flow")
-            flight_val = _get_flight_number_via_api_sequence("\n\n".join(all_texts))
+            flight_val = _get_flight_number_via_api_sequence()
             if flight_val:
                 answers.append(flight_val)
             else:
-                # fall back to normal chain if flow failed
                 logger.info("[flight-flow] flight flow failed; falling back to LLM retrieval")
                 ans = await ask_question(q, chain)
                 answers.append(ans)
@@ -482,16 +497,17 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
         ans = await ask_question(q, chain)
         answers.append(ans)
 
-    # Prepare output JSON object (preserve the requested JSON shape)
+    # Prepare output JSON object
     out = {"answers": answers}
 
-    # Log the exact JSON returned to render logs as requested
+    # Log the exact JSON returned
     try:
         logger.info(f"📤 Response JSON returned to user: {json.dumps(out, ensure_ascii=False)}")
     except Exception:
         logger.info("📤 Response JSON returned to user (could not serialize)")
 
     return AnalyzeResponse(answers=answers)
+
 
 @app.get("/")
 def root():
