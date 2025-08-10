@@ -364,95 +364,51 @@ def extract_flightnumber_from_response(resp: requests.Response) -> str:
         return m.group(1).strip()
     return text
 
-def _get_flight_number_via_api_sequence(doc_text: str) -> str:
-    """
-    Implements the step-by-step flow from the PDF using the parsed doc_text:
-    1) Get favourite city (URL parsed from doc_text if present)
-    2) Parse city->landmark mapping from doc_text
-    3) Parse landmark->endpoint mapping from doc_text
-    4) Choose endpoint, call and extract flight number
-    """
+def _get_flight_number_via_api_sequence(doc_text=None) -> str:
     try:
-        # Parse mapping and endpoints from the doc text
-        city_to_landmark = parse_city_landmark_pairs(doc_text)
-        landmark_to_endpoint, fav_url = parse_landmark_endpoints(doc_text)
-        logger.info(f"[flight-flow] parsed {len(city_to_landmark)} city->landmark mappings and {len(landmark_to_endpoint)} endpoints")
+        # Step 1: Get favourite city from API
+        city_resp = requests.get("https://register.hackrx.in/submissions/myFavouriteCity", timeout=10)
+        city_resp.raise_for_status()
+        city_name = city_resp.text.strip()
+        logger.info(f"[flight-flow] favourite city from API: {city_name!r}")
 
-        # Step 1: call favourite city endpoint
-        fav_resp = requests.get(fav_url, timeout=10)
-        fav_resp.raise_for_status()
-
-        # Try JSON extraction for city
-        city_name = None
-        try:
-            fav_json = fav_resp.json()
-            # common shapes: {"data":{"city":"Chennai"}}, {"city":"Chennai"}, or plain
-            if isinstance(fav_json, dict):
-                if "data" in fav_json and isinstance(fav_json["data"], dict) and "city" in fav_json["data"]:
-                    city_name = fav_json["data"]["city"]
-                elif "city" in fav_json:
-                    city_name = fav_json["city"]
-        except Exception:
-            # not json
-            pass
-
-        if not city_name:
-            # fallback to text
-            city_name = fav_resp.text.strip()
-
-        city_name = (city_name or "").strip()
-        logger.info(f"[flight-flow] favourite city from API: {json.dumps(city_name, ensure_ascii=False)}")
-
-        if not city_name:
-            logger.info("[flight-flow] no city returned by favourite-city API")
-            return None
-
-        # Normalize city
-        city_norm = re.sub(r'[^A-Za-z\s]', '', city_name).strip().lower()
-
-        # Step 2: map city -> landmark
-        landmark = city_to_landmark.get(city_norm)
+        # Step 2: Map city to landmark
+        landmark = _map_city_to_landmark(city_name)
         if not landmark:
-            # attempt a secondary search: find a line containing the city and extract a preceding phrase as landmark
-            city_title = " ".join([w.capitalize() for w in city_norm.split()])
-            m = re.search(r'([A-Za-z][A-Za-z\s\'\-]{2,60}?)\s+' + re.escape(city_title) + r'\b', doc_text)
-            if m:
-                landmark = m.group(1).strip()
-        logger.info(f"[flight-flow] mapped city {city_name!r} -> landmark {landmark!r}")
-
-        # Step 3: pick endpoint
-        endpoint = None
-        if landmark:
-            # try exact match or case-insensitive match against parsed landmark endpoints
-            for lm_key, url in landmark_to_endpoint.items():
-                if lm_key.lower() == landmark.lower():
-                    endpoint = url
-                    break
-            if not endpoint:
-                # fuzzy: check if lm_key is substring of landmark or vice versa
-                for lm_key, url in landmark_to_endpoint.items():
-                    try:
-                        if lm_key.lower() in landmark.lower() or landmark.lower() in lm_key.lower():
-                            endpoint = url
-                            break
-                    except Exception:
-                        continue
-        # fallback to default endpoint parsed from doc
-        if not endpoint:
-            endpoint = landmark_to_endpoint.get("DEFAULT")
-        if not endpoint:
-            logger.info("[flight-flow] no flight endpoint available in document")
+            logger.error(f"[flight-flow] could not map city '{city_name}' to a landmark")
             return None
+        logger.info(f"[flight-flow] mapped city '{city_name}' -> landmark '{landmark}'")
 
+        # Step 3: Map landmark to API endpoint (hardcoded from PDF)
+        endpoint = _LANDMARK_TO_ENDPOINT.get(landmark)
+        if not endpoint:
+            logger.error(f"[flight-flow] no endpoint mapping for landmark '{landmark}'")
+            return None
         logger.info(f"[flight-flow] calling flight endpoint: {endpoint}")
+
+        # Step 4: Call flight number API
         flight_resp = requests.get(endpoint, timeout=10)
         flight_resp.raise_for_status()
-        flight_number = extract_flightnumber_from_response(flight_resp)
-        logger.info(f"[flight-flow] fetched flight number: {flight_number!r}")
-        return flight_number
+
+        try:
+            parsed = flight_resp.json()
+            if isinstance(parsed, dict):
+                for k in ("flight", "flight_number", "flightNumber", "data"):
+                    if k in parsed:
+                        return str(parsed[k]).strip()
+            if isinstance(parsed, (str, int)):
+                return str(parsed).strip()
+        except:
+            pass
+
+        # Step 5: Regex fallback if JSON parse fails
+        m = re.search(r'([A-Z]{2,3}\s?-?\d{1,5}|[A-Z0-9\-]{3,20})', flight_resp.text)
+        return m.group(1).strip() if m else flight_resp.text.strip()
+
     except Exception as e:
         logger.exception("[flight-flow] failed to fetch flight number")
         return None
+
 
 async def get_raw_content_if_api(url: str):
     try:
@@ -537,15 +493,12 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
 
         # --- Flight number procedural flow ---
         if "flight number" in q_lower or ("flight" in q_lower and "number" in q_lower):
-            logger.info("[flight-flow] detected flight-number question; running procedural flow")
-            flight_val = _get_flight_number_via_api_sequence(combined_text)
-            if flight_val:
-                answers.append(flight_val)
-            else:
-                logger.info("[flight-flow] flight flow failed; falling back to LLM retrieval")
-                ans = await ask_question(q, chain)
-                answers.append(ans)
-            continue
+    logger.info("[flight-flow] detected flight-number question; running procedural flow")
+    flight_val = _get_flight_number_via_api_sequence()
+    if flight_val:
+        answers.append(flight_val)
+        continue
+
 
         # existing general flow
         ans = await ask_question(q, chain)
