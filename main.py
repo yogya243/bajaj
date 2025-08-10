@@ -262,7 +262,7 @@ async def analyze_from_url(req: AnalyzeRequest, request: Request):
         # Flight number retrieval
         if "flight number" in q_lower:
             try:
-                resp = requests.get("https://register.hackrx.in/teams/public/flights/getThirdCityFlightNumber", timeout=10)
+                resp = requests.get("https://register.hackrx.in/teams/public/flights/getFourthCityFlightNumber", timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
                 flight_number = data.get("data", {}).get("flightNumber", None)
